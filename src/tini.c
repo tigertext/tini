@@ -17,6 +17,8 @@
 
 #include "tiniConfig.h"
 #include "tiniLicense.h"
+#include <dirent.h>
+#include <ctype.h>
 
 #if TINI_MINIMAL
 #define PRINT_FATAL(...)                         fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n");
@@ -99,6 +101,7 @@ static int32_t expect_status[(STATUS_MAX - STATUS_MIN + 1) / 32];
 
 #define VERBOSITY_ENV_VAR "TINI_VERBOSITY"
 #define KILL_PROCESS_GROUP_GROUP_ENV_VAR "TINI_KILL_PROCESS_GROUP"
+#define KILL_PROCESS_GROUP_BUT_NOT_PARENT_GROUP_ENV_VAR "TINI_KILL_PROCESS_GROUP_BUT_NOT_PARENT"
 
 #define TINI_VERSION_STRING "tini version " TINI_VERSION TINI_GIT
 
@@ -108,6 +111,7 @@ static unsigned int subreaper = 0;
 #endif
 static unsigned int parent_death_signal = 0;
 static unsigned int kill_process_group = 0;
+static unsigned int kill_process_group_but_not_parent = 0;
 
 static unsigned int warn_on_reap = 0;
 
@@ -259,6 +263,7 @@ void print_usage(char* const name, FILE* const file) {
 #endif
 	fprintf(file, "  %s: Set the verbosity level (default: %d).\n", VERBOSITY_ENV_VAR, DEFAULT_VERBOSITY);
 	fprintf(file, "  %s: Send signals to the child's process group.\n", KILL_PROCESS_GROUP_GROUP_ENV_VAR);
+	fprintf(file, "  %s: Send signals to the child's process group but not child itself.\n", KILL_PROCESS_GROUP_BUT_NOT_PARENT_GROUP_ENV_VAR);
 
 	fprintf(file, "\n");
 }
@@ -348,6 +353,10 @@ int parse_args(const int argc, char* const argv[], char* (**child_args_ptr_ptr)[
 				kill_process_group++;
 				break;
 
+			case 'z':
+				kill_process_group_but_not_parent++;
+				break;
+
 			case 'e':
 				if (add_expect_status(optarg)) {
 					PRINT_FATAL("Not a valid option for -e: %s", optarg);
@@ -401,6 +410,10 @@ int parse_env() {
 
 	if (getenv(KILL_PROCESS_GROUP_GROUP_ENV_VAR) != NULL) {
 		kill_process_group++;
+	}
+
+	if (getenv(KILL_PROCESS_GROUP_BUT_NOT_PARENT_GROUP_ENV_VAR) != NULL) {
+		kill_process_group_but_not_parent++;
 	}
 
 	char* env_verbosity = getenv(VERBOSITY_ENV_VAR);
@@ -498,8 +511,68 @@ int configure_signals(sigset_t* const parent_sigset_ptr, const signal_configurat
 	return 0;
 }
 
+void find_child_processes(pid_t parent_pid, pid_t child_pids[], size_t *num_child_pids) {
+    DIR *dir;
+    struct dirent *entry;
+
+    // Open the /proc directory
+    dir = opendir("/proc");
+    if (dir == NULL) {
+        PRINT_FATAL("opendir");
+        exit(EXIT_FAILURE);
+    }
+
+    // Iterate through each process directory in /proc
+    while ((entry = readdir(dir)) != NULL) {
+        // Ignore non-numeric directories and current directory/parent directory
+        if (isdigit(entry->d_name[0])) {
+            char proc_path[270];
+            snprintf(proc_path, sizeof(proc_path), "/proc/%s/status", entry->d_name);
+
+			// Make sure the buffer is large enough
+			size_t path_len = strlen(proc_path);
+			if (path_len >= 255) {
+				PRINT_FATAL("Error: Path length exceeds 255 buffer size\n");
+				exit(EXIT_FAILURE);
+			}
+            // Open the process status file
+            FILE *status_file = fopen(proc_path, "r");
+            if (status_file != NULL) {
+                char line[255];
+                pid_t current_pid = -1;
+                pid_t current_ppid = -1;
+
+                // Read each line in the process status file
+                while (fgets(line, sizeof(line), status_file) != NULL) {
+                    if (sscanf(line, "Pid: %d", &current_pid) == 1) {
+                        // Get the process PID
+                    } else if (sscanf(line, "PPid: %d", &current_ppid) == 1) {
+                        // Get the parent process PID
+                        break;  // Stop reading further
+                    }
+                }
+
+                // Close the process status file
+                fclose(status_file);
+
+                // Check if the parent PID matches
+                if (current_pid != -1 && current_ppid == parent_pid) {
+                    // Store the child PID in the array
+                    child_pids[*num_child_pids] = current_pid;
+                    (*num_child_pids)++;
+                }
+            }
+        }
+    }
+
+    // Close the directory
+    closedir(dir);
+}
+
 int wait_and_forward_signal(sigset_t const* const parent_sigset_ptr, pid_t const child_pid) {
 	siginfo_t sig;
+	size_t num_child_child_pids;
+	pid_t child_child_pids[256];
 
 	if (sigtimedwait(parent_sigset_ptr, &sig, &ts) == -1) {
 		switch (errno) {
@@ -522,13 +595,27 @@ int wait_and_forward_signal(sigset_t const* const parent_sigset_ptr, pid_t const
 				break;
 			default:
 				PRINT_DEBUG("Passing signal: '%s'", strsignal(sig.si_signo));
-				/* Forward anything else */
-				if (kill(kill_process_group ? -child_pid : child_pid, sig.si_signo)) {
-					if (errno == ESRCH) {
-						PRINT_WARNING("Child was dead when forwarding signal");
-					} else {
-						PRINT_FATAL("Unexpected error when forwarding signal: '%s'", strerror(errno));
-						return 1;
+				find_child_processes(child_pid, child_child_pids, &num_child_child_pids);
+				if (kill_process_group_but_not_parent) {
+					for (size_t i=0; i< num_child_child_pids; i++) {
+						if (kill(child_child_pids[i], sig.si_signo)) {
+							if (errno == ESRCH) {
+								PRINT_WARNING("Child was dead when forwarding signal");
+							} else {
+								PRINT_FATAL("Unexpected error when forwarding signal: '%s'", strerror(errno));
+								return 1;
+							}
+						}
+					}
+				} else {
+					/* Forward anything else */
+					if (kill(kill_process_group ? -child_pid : child_pid, sig.si_signo)) {
+						if (errno == ESRCH) {
+							PRINT_WARNING("Child was dead when forwarding signal");
+						} else {
+							PRINT_FATAL("Unexpected error when forwarding signal: '%s'", strerror(errno));
+							return 1;
+						}
 					}
 				}
 				break;
