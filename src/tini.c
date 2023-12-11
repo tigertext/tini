@@ -511,7 +511,7 @@ int configure_signals(sigset_t* const parent_sigset_ptr, const signal_configurat
 	return 0;
 }
 
-void find_child_processes(pid_t parent_pid, pid_t child_pids[], size_t *num_child_pids) {
+void find_child_processe(pid_t parent_pid, pid_t child_pids[], size_t *num_child_pids) {
     DIR *dir;
     struct dirent *entry;
 
@@ -569,10 +569,64 @@ void find_child_processes(pid_t parent_pid, pid_t child_pids[], size_t *num_chil
     closedir(dir);
 }
 
+void get_processes_in_group(pid_t pgid, pid_t pids[], size_t *num_pids) {
+    DIR *dir;
+    struct dirent *entry;
+
+    // Open the /proc directory
+    dir = opendir("/proc");
+    if (dir == NULL) {
+        perror("opendir");
+        exit(EXIT_FAILURE);
+    }
+
+    // Iterate through each process directory in /proc
+    while ((entry = readdir(dir)) != NULL) {
+        // Ignore non-numeric directories and current directory/parent directory
+        if (isdigit(entry->d_name[0])) {
+            char proc_path[270];
+            snprintf(proc_path, sizeof(proc_path), "/proc/%s/status", entry->d_name);
+
+            // Open the process status file
+            FILE *status_file = fopen(proc_path, "r");
+            if (status_file != NULL) {
+                char line[256];
+                pid_t current_pid = -1;
+                pid_t current_pgid = -1;
+
+                // Read each line in the process status file
+                while (fgets(line, sizeof(line), status_file) != NULL) {
+                    if (sscanf(line, "Pid: %d", &current_pid) == 1) {
+                        // Get the process PID
+                    } else if (sscanf(line, "NSpid: %d", &current_pgid) == 1) {
+                        // Get the process group ID
+                        break;  // Stop reading further
+                    }
+                }
+
+                // Close the process status file
+                fclose(status_file);
+
+                // Check if the process is in the specified process group
+                if (current_pid != -1 && current_pgid == pgid) {
+                    // Store the PID in the array
+                    pids[*num_pids] = current_pid;
+                    (*num_pids)++;
+                }
+            }
+        }
+    }
+
+    // Close the directory
+    closedir(dir);
+}
+
 int wait_and_forward_signal(sigset_t const* const parent_sigset_ptr, pid_t const child_pid) {
 	siginfo_t sig;
 	size_t num_child_child_pids;
 	pid_t child_child_pids[256];
+	size_t num_pg_pids;
+	pid_t pg_pids[256];
 
 	if (sigtimedwait(parent_sigset_ptr, &sig, &ts) == -1) {
 		switch (errno) {
@@ -595,9 +649,18 @@ int wait_and_forward_signal(sigset_t const* const parent_sigset_ptr, pid_t const
 				break;
 			default:
 				PRINT_DEBUG("Passing signal: '%s'", strsignal(sig.si_signo));
-				find_child_processes(child_pid, child_child_pids, &num_child_child_pids);
-				if (kill_process_group_but_not_parent) {
+				PRINT_DEBUG("the child_pid is: '%d'", (int)child_pid);
+				find_child_processe(child_pid, child_child_pids, &num_child_child_pids);
+				PRINT_DEBUG("the group pid is: '%d'", (int)child_child_pids[0]);
+				get_processes_in_group(child_child_pids[0], pg_pids, &num_pg_pids);
+				PRINT_DEBUG("num of pids is: '%d'", (int)num_child_child_pids);
+				PRINT_DEBUG("num of pids in group is: '%d'", (int)num_pg_pids);
+				PRINT_DEBUG("the group pid is: '%d'", (int)child_child_pids[0]);
+				PRINT_DEBUG("the pid in group is: '%d'", (int)pg_pids[0]);
+
+				if (1) {
 					for (size_t i=0; i< num_child_child_pids; i++) {
+						PRINT_DEBUG("the pid is: '%d'", (int)child_child_pids[i]);
 						if (kill(child_child_pids[i], sig.si_signo)) {
 							if (errno == ESRCH) {
 								PRINT_WARNING("Child was dead when forwarding signal");
